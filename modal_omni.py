@@ -1,4 +1,4 @@
-from modal import Image, App, web_endpoint, Volume
+from modal import App, web_endpoint, Volume
 import modal
 import os
 from typing import Tuple
@@ -6,7 +6,9 @@ from logging import getLogger
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-
+from PIL import Image
+import io
+from tempfile import NamedTemporaryFile
 class ParseResponse(BaseModel):
     image: str
     parsed_content: str
@@ -30,7 +32,7 @@ def init_ocr():
 
 # Create Modal image with dependencies
 image = (
-    Image.debian_slim()
+    modal.Image.debian_slim()
         .apt_install("git", 
                     "wget", 
                     "libgl1-mesa-glx",  
@@ -43,25 +45,12 @@ image = (
         .add_local_dir("util", "/root/util", copy=True)
         .run_function(init_ocr)
 )
-# Clone repo and download models
-#image = image.run_commands(
- #   "git clone https://github.com/microsoft/OmniParser /root/OmniParser",
-  #  "cd /root/OmniParser && mkdir -p weights/icon_detect weights/icon_caption_florence",
-   # "cd /root/OmniParser && huggingface-cli download microsoft/OmniParser-v2.0 icon_detect/model.pt --local-dir weights",
-    #"cd /root/OmniParser && huggingface-cli download microsoft/OmniParser-v2.0 icon_detect/model.yaml --local-dir weights",
-    #"cd /root/OmniParser && huggingface-cli download microsoft/OmniParser-v2.0 icon_detect/train_args.yaml --local-dir weights",
-    #"cd /root/OmniParser && huggingface-cli download microsoft/Florence-2-base config.json --local-dir weights/icon_caption",
-    #"cd /root/OmniParser && huggingface-cli download microsoft/OmniParser-v2.0 icon_caption/generation_config.json --local-dir weights",
-    #"cd /root/OmniParser && huggingface-cli download microsoft/OmniParser-v2.0 icon_caption/model.safetensors --local-dir weights",
-    #"cd /root/OmniParser && mv weights/icon_caption weights/icon_caption_florence",
-#)
 
-#image = image.env({"EASYOCR_MODULE_PATH": f"{WEIGHTS_DIR}/easyocr"})
 app = App("omniparser", image=image)
 @app.cls(
     image=image,
     volumes={VOLUME_ROOT: volume},  # Mount volume in the container
-    gpu="T4",
+    gpu="A100-40GB",
     scaledown_window=60,
     allow_concurrent_inputs=10,
     #mounts=[modal.Mount.from_local_dir("util", remote_path="/root/util")]
@@ -71,31 +60,45 @@ class OmniparserService:
         volume.reload()  # Ensure volume is up to date
     @modal.enter()
     def load_models(self):
-        
-        import subprocess
-        output = subprocess.check_output(["nvidia-smi"], text=True)
-        print(output)
-        # print the contents of WEIGHTS_DIR
-        LOGGER.info(os.listdir(WEIGHTS_DIR))
-        #from util.utils import check_ocr_box, get_yolo_model, get_caption_model_processor, get_som_labeled_img
-        #import easyocr
-        #reader = easyocr.Reader(['en'])
-        #LOGGER.info(reader)
-        #self.yolo_model = get_yolo_model(model_path=YOLO_DIR)
-        #self.caption_model_processor = get_caption_model_processor(model_name="florence2", model_name_or_path=FLORENCE_DIR)
+        from util.utils import get_yolo_model, get_caption_model_processor
+        self.yolo_model = get_yolo_model(model_path=YOLO_DIR)
+        self.caption_model_processor = get_caption_model_processor(model_name="florence2", model_name_or_path=FLORENCE_DIR)
+    
     @modal.method()
     def process_image(
         self,
         image_bytes: bytes,
         box_threshold: float = 0.05,
-        iou_threshold: float = 0.1
+        iou_threshold: float = 0.1,
+        use_paddleocr: bool = True,
+        imgsz = 640,
     ) -> Tuple[str, str, str]:
-        import subprocess
-        output = subprocess.check_output(["nvidia-smi"], text=True)
-        print(output)
-        assert "Driver Version" in output
-        assert "CUDA Version" in output
-        return None, None, None
+        print('start processing')
+        from util.utils import check_ocr_box, get_som_labeled_img
+        
+        with NamedTemporaryFile(suffix=".png", delete=True) as temp_file:
+            image_save_path = temp_file.name
+        
+            image = Image.open(io.BytesIO(image_bytes))
+            image.save(image_save_path)
+            box_overlay_ratio = image.size[0] / 3200
+            draw_bbox_config = {
+                'text_scale': 0.8 * box_overlay_ratio,
+                'text_thickness': max(int(2 * box_overlay_ratio), 1),
+                'text_padding': max(int(3 * box_overlay_ratio), 1),
+                'thickness': max(int(3 * box_overlay_ratio), 1),
+            }
+            # import pdb; pdb.set_trace()
+
+            ocr_bbox_rslt, is_goal_filtered = check_ocr_box(image_save_path, display_img = False, output_bb_format='xyxy', goal_filtering=None, easyocr_args={'paragraph': False, 'text_threshold':0.9}, use_paddleocr=use_paddleocr)
+            text, ocr_bbox = ocr_bbox_rslt
+            # print('prompt:', prompt)
+            dino_labled_img, label_coordinates, parsed_content_list = get_som_labeled_img(image_save_path, self.yolo_model, BOX_TRESHOLD = box_threshold, output_coord_in_ratio=True, ocr_bbox=ocr_bbox,draw_bbox_config=draw_bbox_config, caption_model_processor=self.caption_model_processor, ocr_text=text,iou_threshold=iou_threshold, imgsz=imgsz,)  
+            image = Image.open(io.BytesIO(base64.b64decode(dino_labled_img)))
+            print('finish processing')
+            parsed_content_list = '\n'.join([f'icon {i}: ' + str(v) for i,v in enumerate(parsed_content_list)])
+        
+            return dino_labled_img, parsed_content_list, str(label_coordinates)
     
 @app.function(image=image)
 @modal.asgi_app()
