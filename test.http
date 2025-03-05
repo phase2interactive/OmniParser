@@ -9,3 +9,14 @@ Content-Type: image/jpeg
 
 < ./imgs/demo_image.jpg
 --boundary--
+
+###
+POST https://phase2interactive-omniparse--omniparser-fastapi-app-dev.modal.run/fast_parse?box_threshold=0.05&iou_threshold=0.1
+Content-Type: multipart/form-data; boundary=boundary
+
+--boundary
+Content-Disposition: form-data; name="file"; filename="demo_image.jpg"
+Content-Type: image/jpeg
+
+< ./imgs/demo_image.jpg
+--boundary--
